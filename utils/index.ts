@@ -7,6 +7,7 @@ import type {DownloadResult} from "~/utils/pool";
 import * as pool from '~/utils/pool';
 import type {DownloadableArticle} from "~/types/types";
 import type {AudioResource, VideoPageInfo} from "~/types/video";
+import {getComment} from "~/apis/index";
 
 
 export function formatTimeStamp(timestamp: number) {
@@ -38,19 +39,31 @@ export function formatItemShowType(type: number) {
  * 使用代理下载资源
  * @param url 资源地址
  * @param proxy 代理地址
+ * @param withCredential
  * @param timeout 超时时间(单位: 秒)，默认 30
  */
-async function downloadAssetWithProxy<T extends Blob | string>(url: string, proxy: string, timeout = 30) {
-    const result = await $fetch<T>(`${proxy}?url=${encodeURIComponent(url)}`, {
+async function downloadAssetWithProxy<T extends Blob | string>(url: string, proxy: string | undefined, withCredential = false, timeout = 30) {
+    const headers: Record<string, string> = {}
+    if (withCredential) {
+        try {
+            const credentials = JSON.parse(window.localStorage.getItem('credentials')!)
+            headers.cookie = `pass_ticket=${credentials.pass_ticket};wap_sid2=${credentials.wap_sid2}`;
+        } catch (e) {}
+    }
+    let targetURL = proxy ? `${proxy}?url=${encodeURIComponent(url)}&headers=${encodeURIComponent(JSON.stringify(headers))}` : url
+    targetURL = targetURL.replace(/^http:\/\//, 'https://')
+    const result = await $fetch<T>(targetURL, {
         retry: 0,
         timeout: timeout * 1000,
     })
 
     // 统计代理下载资源流量
-    if (result instanceof Blob) {
-        pool.pool.incrementTraffic(proxy, result.size)
-    } else {
-        pool.pool.incrementTraffic(proxy, new Blob([result]).size)
+    if (proxy) {
+        if (result instanceof Blob) {
+            pool.pool.incrementTraffic(proxy, result.size)
+        } else {
+            pool.pool.incrementTraffic(proxy, new Blob([result]).size)
+        }
     }
 
     return result
@@ -77,7 +90,7 @@ export async function downloadArticleHTML(articleURL: string, title?: string) {
     const parser = new DOMParser()
 
     const htmlDownloadFn = async (url: string, proxy: string) => {
-        const fullHTML = await downloadAssetWithProxy<string>(url, proxy)
+        const fullHTML = await downloadAssetWithProxy<string>(url, proxy, true)
 
         // 验证是否下载完整
         const document = parser.parseFromString(fullHTML, 'text/html')
@@ -114,7 +127,7 @@ export async function downloadArticleHTMLs(articles: DownloadableArticle[], call
     const results: DownloadableArticle[] = []
 
     const htmlDownloadFn = async (article: DownloadableArticle, proxy: string) => {
-        const fullHTML = await downloadAssetWithProxy<string>(article.url, proxy)
+        const fullHTML = await downloadAssetWithProxy<string>(article.url, proxy, true)
 
         // 验证是否下载完整
         const document = parser.parseFromString(fullHTML, 'text/html')
@@ -158,6 +171,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
     const parser = new DOMParser()
     const document = parser.parseFromString(html, 'text/html')
     const $jsArticleContent = document.querySelector('#js_article')!
+    const $jsArticleBottomBar = document.querySelector('#js_article_bottom_bar')!
 
     // #js_content 默认是不可见的(通过js修改为可见)，需要移除该样式
     $jsArticleContent.querySelector('#js_content')?.removeAttribute('style')
@@ -174,49 +188,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
     $jsArticleContent.querySelector('#wx_stream_article_slide_tip')?.remove()
 
 
-    let bodyCls = ''
-    const $js_image_desc = $jsArticleContent.querySelector('#js_image_desc')
-    // 图片分享消息
-    if ($js_image_desc) {
-        bodyCls += 'pages_skin_pc page_share_img'
-
-        function decode_html(data: string, encode: boolean) {
-            const replace = ["&#39;", "'", "&quot;", '"', "&nbsp;", " ", "&gt;", ">", "&lt;", "<", "&yen;", "¥", "&amp;", "&"];
-            const replaceReverse = ["&", "&amp;", "¥", "&yen;", "<", "&lt;", ">", "&gt;", " ", "&nbsp;", '"', "&quot;", "'", "&#39;"];
-
-            let target = encode ? replaceReverse : replace
-            let str = data
-            for (let i = 0; i < target.length; i += 2) {
-                str = str.replace(new RegExp(target[i], 'g'), target[i + 1])
-            }
-            return str
-        }
-
-        const qmtplMatchResult = html.match(/(?<code>window\.__QMTPL_SSR_DATA__\s*=\s*\{.+?)<\/script>/s)
-        if (qmtplMatchResult && qmtplMatchResult.groups && qmtplMatchResult.groups.code) {
-            const code = qmtplMatchResult.groups.code
-            eval(code)
-            const data = (window as any).__QMTPL_SSR_DATA__
-            let desc = data.desc.replace(/\r/g, '').replace(/\n/g, '<br>').replace(/\s/g, '&nbsp;')
-            desc = decode_html(desc, false)
-            $js_image_desc.innerHTML = desc
-
-            $jsArticleContent.querySelector('#js_top_profile')!.classList.remove('profile_area_hide')
-        }
-        const pictureMatchResult = html.match(/(?<code>window\.picture_page_info_list\s*=.+\.slice\(0,\s*20\);)/s)
-        if (pictureMatchResult && pictureMatchResult.groups && pictureMatchResult.groups.code) {
-            const code = pictureMatchResult.groups.code
-            eval(code)
-            const picture_page_info_list = (window as any).picture_page_info_list
-            const containerEl = $jsArticleContent.querySelector('#js_share_content_page_hd')!
-            let innerHTML = '<div style="display: flex;flex-direction: column;align-items: center;gap: 10px;padding-block: 20px;">'
-            for (const picture of picture_page_info_list) {
-                innerHTML += `<img src="${picture.cdn_url}" alt="" style="display: block;border: 1px solid gray;border-radius: 5px;max-width: 90%;" onclick="window.open(this.src, '_blank', 'popup')" />`
-            }
-            innerHTML += '</div>'
-            containerEl.innerHTML = innerHTML
-        }
-    }
+    let bodyCls = document.body.className
 
     // 渲染发布时间
     function __setPubTime(oriTimestamp: number, dom: HTMLElement) {
@@ -282,11 +254,199 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
         __setTitleModify(titleModifiedMatchResult.groups.data === '1')
     }
 
+    // 下载留言数据
+    let commentHTML = ''
+    const commentIdMatchResult = html.match(/var comment_id = '(?<comment_id>\d+)' \|\| '0';/)
+    if (commentIdMatchResult && commentIdMatchResult.groups && commentIdMatchResult.groups.comment_id) {
+        const comment_id = commentIdMatchResult.groups.comment_id
+        const commentResponse = await getComment(comment_id)
+        // 抓到了留言数据
+        if (commentResponse) {
+            // 留言总数
+            const totalCount = commentResponse.elected_comment.length + commentResponse.elected_comment.reduce((total, item) => {
+                return total + item.reply_new.reply_total_cnt
+            }, 0)
+
+            commentHTML += '<div style="max-width: 667px;margin: 0 auto;padding: 10px 10px 80px;">'
+            commentHTML += `<p style="font-size: 15px;color: #949494;">留言 ${totalCount}</p>`
+            commentHTML += '<div style="margin-top: -10px;">'
+            commentResponse.elected_comment.forEach((comment) => {
+                commentHTML += '<div style="margin-top: 25px;"><div style="display: flex;">'
+                if ([1, 2].includes(comment.identity_type)) {
+                    commentHTML += `<img src="${comment.logo_url}" style="display: block;width: 30px;height: 30px;border-radius: 50%;margin-right: 8px;" alt="">`
+                } else {
+                    commentHTML += `<img src="${comment.logo_url}" style="display: block;width: 30px;height: 30px;border-radius: 2px;margin-right: 8px;" alt="">`
+                }
+                commentHTML += '<div style="flex: 1;"><p style="display: flex;line-height: 16px;margin-bottom: 5px;">'
+                commentHTML += `<span style="margin-right: 5px;font-size: 15px;color: #949494;">${comment.nick_name}</span>`
+                commentHTML += `<span style="margin-right: 5px;font-size: 12px;color: #b5b5b5;">${comment?.ip_wording?.province_name}</span>`
+                commentHTML += `<span style="font-size: 12px;color: #b5b5b5;">${formatAlbumTime(comment.create_time)}</span>`
+                commentHTML += '<span style="flex: 1;"></span><span style="display: inline-flex;align-items: center;">'
+                commentHTML += `<span class="sns_opr_btn sns_praise_btn" style="font-size: 12px;color: #8b8a8a;">${comment.like_num || ''}</span>`
+                commentHTML += '</span></p>'
+                commentHTML += `<p style="font-size: 15px;color: #333;white-space: pre-line;">${comment.content}</p>`
+                commentHTML += '</div></div>'
+
+                if (comment.reply_new && comment.reply_new.reply_list.length > 0) {
+                    commentHTML += '<div style="padding-left: 38px;">'
+                    comment.reply_new.reply_list.forEach((reply) => {
+                        commentHTML += '<div style="display: flex;margin-top: 15px;">'
+                        if ([1, 2].includes(reply.identity_type)) {
+                            commentHTML += `<img src="${reply.logo_url}" style="display: block;width: 23px;height: 23px;border-radius: 50%;margin-right: 8px;" alt="">`
+                        } else {
+                            commentHTML += `<img src="${reply.logo_url}" style="display: block;width: 23px;height: 23px;border-radius: 2px;margin-right: 8px;" alt="">`
+                        }
+                        commentHTML += '<div style="flex: 1;"><p style="display: flex;line-height: 16px;margin-bottom: 5px;">'
+                        commentHTML += `<span style="margin-right: 5px;font-size: 15px;color: #949494;">${reply.nick_name}</span>`
+                        commentHTML += `<span style="margin-right: 5px;font-size: 12px;color: #b5b5b5;">${reply?.ip_wording?.province_name}</span>`
+                        commentHTML += `<span style="font-size: 12px;color: #b5b5b5;">${formatAlbumTime(reply.create_time)}</span>`
+                        commentHTML += '<span style="flex: 1;"></span><span style="display: inline-flex;align-items: center; font-size: 12px;color: #b5b5b5;">'
+                        commentHTML += `<span class="sns_opr_btn sns_praise_btn" style="font-size: 12px;color: #8b8a8a;">${reply.reply_like_num || ''}</span>`
+                        commentHTML += '</span></p>'
+                        commentHTML += `<p style="font-size: 15px;color: #333;white-space: pre-line;">${reply.content}</p>`
+                        commentHTML += '</div></div>'
+                    })
+                    commentHTML += '</div>'
+                }
+                if (comment.reply_new.reply_total_cnt - comment.reply_new.reply_list.length > 0) {
+                    commentHTML += '<p style="display: flex;align-items: center; font-size: 14px;color: #a3a0a0;padding-left: 38px;padding-top: 5px;">'
+                    commentHTML += `<span>${comment.reply_new.reply_total_cnt - comment.reply_new.reply_list.length}条回复</span>`
+                    commentHTML += '<img src="https://wxa.wxs.qq.com/images/wxapp/feedback_icon.png" alt="" style="filter: invert(1);width: 10px;height: 6px;margin-left: 5px;">'
+                    commentHTML += '</p>'
+                }
+                commentHTML += '</div>'
+            })
+            commentHTML += '</div></div>'
+        }
+    }
+
+    // 阅读量
+    let readNum = -1
+    const readNumMatchResult = html.match(/var read_num = ['"](?<read_num>\d+)['"] \* 1;/)
+    const readNumNewMatchResult = html.match(/var read_num_new = ['"](?<read_num_new>\d+)['"] \* 1;/)
+    if (readNumNewMatchResult && readNumNewMatchResult.groups && readNumNewMatchResult.groups.read_num_new) {
+        readNum = parseInt(readNumNewMatchResult.groups.read_num_new, 10)
+    } else if (readNumMatchResult && readNumMatchResult.groups && readNumMatchResult.groups.read_num) {
+        readNum = parseInt(readNumMatchResult.groups.read_num, 10)
+    }
+
+    const $js_image_desc = $jsArticleContent.querySelector('#js_image_desc')
+    // 图片分享消息
+    if ($js_image_desc) {
+        bodyCls += 'pages_skin_pc page_share_img'
+
+        function decode_html(data: string, encode: boolean) {
+            const replace = ["&#39;", "'", "&quot;", '"', "&nbsp;", " ", "&gt;", ">", "&lt;", "<", "&yen;", "¥", "&amp;", "&"];
+            const replaceReverse = ["&", "&amp;", "¥", "&yen;", "<", "&lt;", ">", "&gt;", " ", "&nbsp;", '"', "&quot;", "'", "&#39;"];
+
+            let target = encode ? replaceReverse : replace
+            let str = data
+            for (let i = 0; i < target.length; i += 2) {
+                str = str.replace(new RegExp(target[i], 'g'), target[i + 1])
+            }
+            return str
+        }
+
+        const qmtplMatchResult = html.match(/(?<code>window\.__QMTPL_SSR_DATA__\s*=\s*\{.+?)<\/script>/s)
+        if (qmtplMatchResult && qmtplMatchResult.groups && qmtplMatchResult.groups.code) {
+            const code = qmtplMatchResult.groups.code
+            eval(code)
+            const data = (window as any).__QMTPL_SSR_DATA__
+            let desc = data.desc.replace(/\r/g, '').replace(/\n/g, '<br>').replace(/\s/g, '&nbsp;')
+            desc = decode_html(desc, false)
+            $js_image_desc.innerHTML = desc
+
+            $jsArticleContent.querySelector('#js_top_profile')!.classList.remove('profile_area_hide')
+        }
+        const pictureMatchResult = html.match(/(?<code>window\.picture_page_info_list\s*=.+\.slice\(0,\s*20\);)/s)
+        if (pictureMatchResult && pictureMatchResult.groups && pictureMatchResult.groups.code) {
+            const code = pictureMatchResult.groups.code
+            eval(code)
+            const picture_page_info_list = (window as any).picture_page_info_list
+            const containerEl = $jsArticleContent.querySelector('#js_share_content_page_hd')!
+            let innerHTML = '<div style="display: flex;flex-direction: column;align-items: center;gap: 10px;padding-block: 20px;">'
+            for (const picture of picture_page_info_list) {
+                innerHTML += `<img src="${picture.cdn_url}" alt="" style="display: block;border: 1px solid gray;border-radius: 5px;max-width: 90%;" onclick="window.open(this.src, '_blank', 'popup')" />`
+            }
+            innerHTML += '</div>'
+            containerEl.innerHTML = innerHTML
+        }
+    }
+
+    // 视频分享消息
+    const $js_common_share_desc = $jsArticleContent.querySelector('#js_common_share_desc')
+    if ($js_common_share_desc) {
+        // 分享视频摘要
+        bodyCls += 'zh_CN wx_wap_page wx_wap_desktop_fontsize_2 page_share_video white_video_page discuss_tab appmsg_skin_default appmsg_style_default pages_skin_pc'
+        const videoContentMatchResult = html.match(/(?<code>var\s+videoContentNoEncode\s*=\s*window\.a_value_which_never_exists\s*\|\|\s*(?<value>'[^']+'))/s)
+        if (videoContentMatchResult && videoContentMatchResult.groups && videoContentMatchResult.groups.value) {
+            const code = 'window.videoContentNoEncode = ' + videoContentMatchResult.groups.value
+            eval(code)
+            let desc = (window as any).videoContentNoEncode
+            desc = desc.replace(/\r/g, '').replace(/\n/g, '<br>')
+            $js_common_share_desc.innerHTML = desc
+        }
+    }
+    const $js_mpvedio = $jsArticleContent.querySelector('.js_video_channel_container > #js_mpvedio')
+    if ($js_mpvedio) {
+        // 分享视频
+        // poster
+        let poster = ''
+        const mpVideoCoverUrlMatchResult = html.match(/(?<code>window\.__mpVideoCoverUrl\s*=\s*'[^']*';)/s)
+        if (mpVideoCoverUrlMatchResult && mpVideoCoverUrlMatchResult.groups && mpVideoCoverUrlMatchResult.groups.code) {
+            const code = mpVideoCoverUrlMatchResult.groups.code
+            eval(code)
+            poster = (window as any).__mpVideoCoverUrl
+        }
+
+        // video info
+        let videoUrl = ''
+        const mpVideoTransInfoMatchResult = html.match(/(?<code>window\.__mpVideoTransInfo\s*=\s*\[.+?];)/s)
+        if (mpVideoTransInfoMatchResult && mpVideoTransInfoMatchResult.groups && mpVideoTransInfoMatchResult.groups.code) {
+            const code = mpVideoTransInfoMatchResult.groups.code
+            eval(code)
+            const mpVideoTransInfo = (window as any).__mpVideoTransInfo
+            if (Array.isArray(mpVideoTransInfo) && mpVideoTransInfo.length > 0) {
+                mpVideoTransInfo.forEach((trans: any) => {
+                    trans.url = trans.url.replace(/&amp;/g, '&')
+                })
+
+                // 这里为了节省流量需要控制清晰度
+                videoUrl = mpVideoTransInfo[mpVideoTransInfo.length - 1].url
+
+                // 下载资源
+                const videoURLMap = new Map<string, string>()
+                const resourceDownloadFn = async (url: string, proxy: string) => {
+                    const videoData = await downloadAssetWithProxy<Blob>(url, proxy, false,10)
+                    const uuid = new Date().getTime() + Math.random().toString()
+                    const ext = mime.getExtension(videoData.type)
+                    zip.file(`assets/${uuid}.${ext}`, videoData)
+
+                    videoURLMap.set(url, `./assets/${uuid}.${ext}`)
+                    return videoData.size
+                }
+                await measureExecutionTime('视频资源下载结果:', async () => {
+                    const urls: string[] = []
+                    if (poster) {
+                        urls.push(poster)
+                    }
+                    urls.push(videoUrl)
+                    return await pool.downloads<string>(urls, resourceDownloadFn, false)
+                })
+
+                const div = document.createElement('div')
+                div.style.cssText = 'height: 381px;background: #000;border-radius: 4px; overflow: hidden;margin-bottom: 12px;'
+                div.innerHTML = `<video src="${videoURLMap.get(videoUrl)}" poster="${videoURLMap.get(poster)}" controls style="width: 100%;height: 100%;"></video>`
+                $js_mpvedio.appendChild(div)
+            }
+        }
+    }
+
     // 下载内嵌音频
     const mpAudioEls = $jsArticleContent.querySelectorAll<HTMLElement>('mp-common-mpaudio')
     if (mpAudioEls.length > 0) {
         const audioResourceDownloadFn = async (asset: AudioResource, proxy: string) => {
-            const audioData = await downloadAssetWithProxy<Blob>(asset.url, proxy, 10)
+            const audioData = await downloadAssetWithProxy<Blob>(asset.url, proxy, false, 10)
             const uuid = asset.uuid
             const ext = mime.getExtension(audioData.type)
             zip.file(`assets/${uuid}.${ext}`, audioData)
@@ -329,7 +489,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
                 })
             })
 
-            return await pool.downloads<AudioResource>(assets, audioResourceDownloadFn)
+            return await pool.downloads<AudioResource>(assets, audioResourceDownloadFn, false)
         })
     }
 
@@ -348,7 +508,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
         // 下载资源
         const videoURLMap = new Map<string, string>()
         const resourceDownloadFn = async (url: string, proxy: string) => {
-            const videoData = await downloadAssetWithProxy<Blob>(url, proxy, 10)
+            const videoData = await downloadAssetWithProxy<Blob>(url, proxy, false,10)
             const uuid = new Date().getTime() + Math.random().toString()
             const ext = mime.getExtension(videoData.type)
             zip.file(`assets/${uuid}.${ext}`, videoData)
@@ -364,7 +524,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
                     urls.push(videoPageInfo.mp_video_trans_info[0].url)
                 }
             })
-            return await pool.downloads<string>(urls, resourceDownloadFn)
+            return await pool.downloads<string>(urls, resourceDownloadFn, false)
         })
 
         const videoIframes = $jsArticleContent.querySelectorAll('iframe.video_iframe')
@@ -398,7 +558,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
             return 0
         }
 
-        const imgData = await downloadAssetWithProxy<Blob>(url, proxy, 10)
+        const imgData = await downloadAssetWithProxy<Blob>(url, proxy, false, 10)
         const uuid = new Date().getTime() + Math.random().toString()
         const ext = mime.getExtension(imgData.type)
         zip.file(`assets/${uuid}.${ext}`, imgData)
@@ -418,6 +578,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
 
     // 下载背景图片 背景图片无法用选择器选中并修改，因此用正则进行匹配替换
     let pageContentHTML = $jsArticleContent.outerHTML
+    const jsArticleBottomBarHTML = $jsArticleBottomBar?.outerHTML
 
     // 收集所有的背景图片地址
     const bgImageURLs = new Set<string>()
@@ -428,7 +589,7 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
     if (bgImageURLs.size > 0) {
         // 下载背景图片
         const bgImgDownloadFn = async (url: string, proxy: string) => {
-            const imgData = await downloadAssetWithProxy<Blob>(url, proxy, 10)
+            const imgData = await downloadAssetWithProxy<Blob>(url, proxy, false,10)
             const uuid = new Date().getTime() + Math.random().toString()
             const ext = mime.getExtension(imgData.type)
 
@@ -602,12 +763,19 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
     <title>${title}</title>
     ${localLinks}
     <style>
-        #page-content {
+        #page-content,
+        #js_article_bottom_bar,
+        .__page_content__ {
             max-width: 667px;
             margin: 0 auto;
         }
         img {
             max-width: 100%;
+        }
+        .sns_opr_btn::before {
+            width: 16px;
+            height: 16px;
+            margin-right: 3px;
         }
     </style>
 </head>
@@ -615,6 +783,11 @@ export async function packHTMLAssets(html: string, title: string, zip?: JSZip) {
 ${customElementTemplate}
 
 ${pageContentHTML}
+${jsArticleBottomBarHTML}
+
+${readNum !== -1 ? '<p class="__page_content__">阅读量 ' + readNum + '</p>' : ''}
+<!-- 评论数据 -->
+${commentHTML}
 </body>
 </html>`
 
